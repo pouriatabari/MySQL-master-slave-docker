@@ -27,20 +27,22 @@ yum -y install vim git wget curl yum-utils net-tools tree  telnet && yum -y upda
 ```
 5. Create mysql master config file. Please pay attention to this file. This file is very important
 ```
-cat <<EOT >> /root/master-slave/master/config/10-mysqld.cnf
+cat <<EOF >> /root/master-slave/master/config/10-mysqld.cnf
 [mysqld]
 pid-file  = /var/run/mysqld/mysqld-pid
 socket    = /var/run/mysqld/mysqld.sock
 datadir   = /var/lib/mysql	symbolic-link= 0
+EOF
 ```
 6. Now, we are creating a master config file, specific for replication:
 ```
-cat <<EOT >> /root/master-slave/master/config/60-enable-replication.cnf
+cat <<EOF >> /root/master-slave/master/config/60-enable-replication.cnf
 [mysqld]
 #this is unique for master and slave, master server ids must be greater than slave server id
 server-id	    =	1
 log-bin		    =	mysql-bin
 binlog_do_db	=	test_db  # this is a name of database which must be replicated
+EOF
 ```
 7. It is time to running mysql master container:
 ```
@@ -75,6 +77,7 @@ relay_log	    =	mysql-relay
 log_bin		    =	mysql-bin
 binlog_do_db	=	test_db
 read_only	    =	1
+EOF
 ```
 13. Next, you must running container:
 ```
