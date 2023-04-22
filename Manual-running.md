@@ -46,7 +46,7 @@ EOF
 ```
 7. It is time to running mysql master container:
 ```
-docker run -d –rm –name mysql-master -p 33060:3306 -e MYSQL_ROOT_PASSWORD=123456@Aa -e MYSQL_DATABASE=test_db -v /root/master-slave/master/db_master:/var/lib/mysql -v /root/master-slave/master/config/:/etc/mysql/mysql.conf.d mysql
+docker run -d --rm --name mysql-master -p 33060:3306 -e MYSQL_ROOT_PASSWORD=123456@Aa -e MYSQL_DATABASE=test_db -v /root/master-slave/master/db_master:/var/lib/mysql -v /root/master-slave/master/config/:/etc/mysql/mysql.conf.d mysql
 ```
 8. Check the container is up and status is normal:
 ```
@@ -56,8 +56,8 @@ docker ps
 ```
 docker exec -it mysql-master /bin/bash
 mysql -uroot -p123456@Aa
-create user ‘slave’@’%’ identified with mysql_native_password by ‘123456@Aa’;
-grant replication slave on *.* to ‘slave’@’%’;
+create user 'slave'@'%' identified with mysql_native_password by '123456@Aa';
+grant replication slave on *.* to 'slave'@'%';
 flush privileges;
 ```
 10. Now you must getting dump mysql master and import to slave:
@@ -81,7 +81,7 @@ EOF
 ```
 13. Next, you must running container:
 ```
-docker run –rm -d –name mysql-slave –link mysql-master:db -p 33061:3306 -e MYSQL_ROOT_PASSWORD=123456@Aa -e MYSQL_DATABASE=test_db -v /root/master-slave/slave/db_slave/:/var/lib/mysql -v /root/master-slave/slave/config/:/etc/mysql/mysql.conf.d mysql
+docker run --rm -d --name mysql-slave --link mysql-master:db -p 33061:3306 -e MYSQL_ROOT_PASSWORD=123456@Aa -e MYSQL_DATABASE=test_db -v /root/master-slave/slave/db_slave/:/var/lib/mysql -v /root/master-slave/slave/config/:/etc/mysql/mysql.conf.d mysql
 ```
 14. Copy dump to path of slave container:
 ```
@@ -95,7 +95,7 @@ mysqldump -uroot -p123456@Aa test_db < /var/lib/mysql/data.sql
 16. In to the container, you must go to the mysql cli and inserting the following command:
 ```
 mysql -uroot =p123456@Aa
-change master to MASTER_HOST=’db’ , MASTER_USER=’slave’ , MASTER_PASSWORD=’123456@Aa’ , MASTER_LOG_FILE={YOUR_LOG_FILE_NAME_IN_THE_MASTER_STATUS} , MASTER_LOG_POS={YOUR_POS_NUMBER IN_THE_MASTER_STATUS};
+change master to MASTER_HOST='db' , MASTER_USER='slave' , MASTER_PASSWORD='123456@Aa' , MASTER_LOG_FILE='YOUR_LOG_FILE_NAME_IN_THE_MASTER_STATUS' , MASTER_LOG_POS='YOUR_POS_NUMBER IN_THE_MASTER_STATUS';
 set global server_id=2;
 start slave;
 ```
