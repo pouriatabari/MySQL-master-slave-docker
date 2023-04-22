@@ -94,7 +94,7 @@ mysqldump -uroot -p123456@Aa test_db < /var/lib/mysql/data.sql
 ```
 16. In to the container, you must go to the mysql cli and inserting the following command:
 ```
-mysql -uroot =p123456@Aa
+mysql -uroot -p123456@Aa
 change master to MASTER_HOST='db' , MASTER_USER='slave' , MASTER_PASSWORD='123456@Aa' , MASTER_LOG_FILE='YOUR_LOG_FILE_NAME_IN_THE_MASTER_STATUS' , MASTER_LOG_POS='YOUR_POS_NUMBER IN_THE_MASTER_STATUS';
 set global server_id=2;
 start slave;
