@@ -3,8 +3,8 @@ package ui
 import (
 	"fmt"
 	"strconv"
-	"time"
 
+	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
 )
 
@@ -20,6 +20,13 @@ type SetupConfig struct {
 	BaseDir         string
 	MasterContainer string
 	SlaveContainer  string
+}
+
+type LoadTestFormConfig struct {
+	Workers      int
+	RequestsPerW int
+	PayloadSize  int
+	Cleanup      bool
 }
 
 type UI struct {
@@ -92,7 +99,7 @@ func NewUI(loggerSink interface {
 }
 
 func (u *UI) bindKeys() {
-	u.app.SetInputCapture(func(event *tview.EventKey) *tview.EventKey {
+	u.app.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		switch event.Rune() {
 		case 'q':
 			u.app.Stop()
@@ -146,12 +153,13 @@ func (u *UI) Run() error {
 }
 
 func (u *UI) ShowConfirmDialog(title, message string) bool {
-	confirmed := false
+	doneCh := make(chan bool, 1)
+
 	dialog := tview.NewModal().
 		SetText(message).
 		AddButtons([]string{"Yes", "No"}).
 		SetDoneFunc(func(buttonIndex int, buttonLabel string) {
-			confirmed = buttonLabel == "Yes"
+			doneCh <- buttonLabel == "Yes"
 			u.pages.RemovePage("confirm")
 			u.app.SetFocus(u.root)
 		})
@@ -166,17 +174,7 @@ func (u *UI) ShowConfirmDialog(title, message string) bool {
 		u.app.SetFocus(dialog)
 	})
 
-	for {
-		if !u.app.IsRunning() {
-			break
-		}
-		if !u.pages.HasPage("confirm") {
-			break
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-
-	return confirmed
+	return <-doneCh
 }
 
 func (u *UI) CurrentConfig() *SetupConfig {
@@ -218,17 +216,18 @@ func (u *UI) ShowSetupForm() (*SetupConfig, error) {
 			sp, _ := strconv.Atoi(slavePort)
 
 			cfg := &SetupConfig{
-			MySQLVersion:    mysqlVersion,
-			MasterPort:      mp,
-			SlavePort:       sp,
-			RootPassword:    rootPassword,
-			ReplUser:        replUser,
-			ReplPassword:    replPassword,
-			DatabaseName:    dbName,
-			NetworkName:     networkName,
-			BaseDir:         baseDir,
-			MasterContainer: masterContainer,
-			SlaveContainer:  slaveContainer,
+				MySQLVersion:    mysqlVersion,
+				MasterPort:      mp,
+				SlavePort:       sp,
+				RootPassword:    rootPassword,
+				ReplUser:        replUser,
+				ReplPassword:    replPassword,
+				DatabaseName:    dbName,
+				NetworkName:     networkName,
+				BaseDir:         baseDir,
+				MasterContainer: masterContainer,
+				SlaveContainer:  slaveContainer,
+			}
 
 			u.currentCfg = cfg
 			resultCh <- cfg
@@ -257,4 +256,65 @@ func (u *UI) ShowSetupForm() (*SetupConfig, error) {
 	}
 
 	return cfg, nil
+}
+
+func (u *UI) ShowLoadTestForm() (LoadTestFormConfig, bool) {
+	resultCh := make(chan LoadTestFormConfig, 1)
+	cancelCh := make(chan struct{}, 1)
+
+	form := tview.NewForm()
+	form.SetBorder(true).SetTitle(" Load Test Settings ").SetTitleAlign(tview.AlignLeft)
+
+	workers := "4"
+	requestsPerW := "250"
+	payloadSize := "128"
+	cleanup := "false"
+
+	form.
+		AddInputField("Workers", workers, 10, nil, func(text string) { workers = text }).
+		AddInputField("Requests/Worker", requestsPerW, 10, nil, func(text string) { requestsPerW = text }).
+		AddInputField("Payload Size (bytes)", payloadSize, 10, nil, func(text string) { payloadSize = text }).
+		AddCheckbox("Cleanup table after test", false, func(checked bool) {
+			if checked {
+				cleanup = "true"
+			} else {
+				cleanup = "false"
+			}
+		}).
+		AddButton("Run", func() {
+			w, _ := strconv.Atoi(workers)
+			r, _ := strconv.Atoi(requestsPerW)
+			p, _ := strconv.Atoi(payloadSize)
+
+			resultCh <- LoadTestFormConfig{
+				Workers:      w,
+				RequestsPerW: r,
+				PayloadSize:  p,
+				Cleanup:      cleanup == "true",
+			}
+			u.pages.RemovePage("loadtest")
+			u.app.SetFocus(u.root)
+		}).
+		AddButton("Cancel", func() {
+			cancelCh <- struct{}{}
+			u.pages.RemovePage("loadtest")
+			u.app.SetFocus(u.root)
+		})
+
+	modal := tview.NewFlex().
+		AddItem(nil, 0, 1, false).
+		AddItem(form, 70, 1, true).
+		AddItem(nil, 0, 1, false)
+
+	u.app.QueueUpdateDraw(func() {
+		u.pages.AddPage("loadtest", modal, true, true)
+		u.app.SetFocus(form)
+	})
+
+	select {
+	case cfg := <-resultCh:
+		return cfg, true
+	case <-cancelCh:
+		return LoadTestFormConfig{}, false
+	}
 }

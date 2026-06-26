@@ -32,9 +32,7 @@ func (m *Manager) CreateNetwork(name string) error {
 	}
 
 	m.logger.Info("Creating docker network: " + name)
-	_, err = m.cli.NetworkCreate(m.ctx, name, network.CreateOptions{
-		CheckDuplicate: true,
-	})
+	_, err = m.cli.NetworkCreate(m.ctx, name, network.CreateOptions{})
 	if err != nil {
 		return fmt.Errorf("network create failed: %w", err)
 	}
@@ -63,6 +61,10 @@ func (m *Manager) renderTemplate(templatePath string, outPath string, data any) 
 }
 
 func (m *Manager) PrepareEnvironment(cfg *ui.SetupConfig) error {
+	if err := m.ensureDockerClient(); err != nil {
+		return err
+	}
+
 	m.logger.Info("Preparing working directories...")
 	dirs, err := utils.BuildWorkDirs(cfg.BaseDir)
 	if err != nil {

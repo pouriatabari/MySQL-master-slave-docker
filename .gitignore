@@ -1,5 +1,6 @@
 bin/
 dist/
+workdir/
 tmp/
 *.exe
 *.log

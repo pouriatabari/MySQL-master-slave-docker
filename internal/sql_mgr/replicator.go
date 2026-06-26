@@ -39,7 +39,7 @@ GRANT REPLICATION SLAVE ON *.* TO '%s'@'%%';
 FLUSH PRIVILEGES;
 `, cfg.ReplUser, cfg.ReplPassword, cfg.ReplUser)
 
-	_, err := r.docker.Exec("mysql-master", []string{
+	_, err := r.docker.Exec(cfg.MasterContainer, []string{
 		"sh", "-c",
 		fmt.Sprintf(`mysql -uroot -p'%s' -e "%s"`, cfg.RootPassword, oneLineSQL(createUserSQL)),
 	})
@@ -49,12 +49,8 @@ FLUSH PRIVILEGES;
 
 	r.logger.Success("Replication user created on master")
 
-	if err := r.RunDumpWithFallback(cfg); err != nil {
-		return err
-	}
-
-	r.logger.Info("Reading master status...")
-	out, err := r.docker.Exec("mysql-master", []string{
+	r.logger.Info("Reading master binlog position before dump...")
+	out, err := r.docker.Exec(cfg.MasterContainer, []string{
 		"sh", "-c",
 		fmt.Sprintf(`mysql -uroot -p'%s' -e "SHOW MASTER STATUS\G"`, cfg.RootPassword),
 	})
@@ -67,7 +63,11 @@ FLUSH PRIVILEGES;
 		return fmt.Errorf("parse master status failed: %w", err)
 	}
 
-	r.logger.Success(fmt.Sprintf("Master status detected: file=%s pos=%d", logFile, logPos))
+	r.logger.Success(fmt.Sprintf("Master status captured: file=%s pos=%d", logFile, logPos))
+
+	if err := r.RunDumpWithFallback(cfg); err != nil {
+		return err
+	}
 
 	masterDumpPath := filepath.Join(cfg.BaseDir, "master", "db_master", "data.sql")
 	slaveDumpPath := filepath.Join(cfg.BaseDir, "slave", "db_slave", "data.sql")
@@ -82,10 +82,10 @@ FLUSH PRIVILEGES;
 		return fmt.Errorf("run slave failed: %w", err)
 	}
 
-	r.logger.Info("Importing dump into slave...")
-	_, err = r.docker.Exec("mysql-slave", []string{
+	r.logger.Info("Importing dump into slave with mysql client...")
+	_, err = r.docker.Exec(cfg.SlaveContainer, []string{
 		"sh", "-c",
-		fmt.Sprintf(`mysql -uroot -p'%s' < /var/lib/mysql/data.sql`, cfg.RootPassword),
+		fmt.Sprintf(`mysql -uroot -p'%s' %s < /var/lib/mysql/data.sql`, cfg.RootPassword, cfg.DatabaseName),
 	})
 	if err != nil {
 		return fmt.Errorf("import dump into slave failed: %w", err)
@@ -94,29 +94,9 @@ FLUSH PRIVILEGES;
 	r.logger.Success("Dump imported into slave")
 
 	r.logger.Info("Configuring replication on slave...")
-
-	changeSourceSQL := fmt.Sprintf(`
-STOP REPLICA;
-RESET REPLICA ALL;
-CHANGE REPLICATION SOURCE TO
-  SOURCE_HOST='mysql-master',
-  SOURCE_USER='%s',
-  SOURCE_PASSWORD='%s',
-  SOURCE_LOG_FILE='%s',
-  SOURCE_LOG_POS=%d,
-  GET_SOURCE_PUBLIC_KEY=1;
-START REPLICA;
-`, cfg.ReplUser, cfg.ReplPassword, logFile, logPos)
-
-	_, err = r.docker.Exec("mysql-slave", []string{
-		"sh", "-c",
-		fmt.Sprintf(`mysql -uroot -p'%s' -e "%s"`, cfg.RootPassword, oneLineSQL(changeSourceSQL)),
-	})
-	if err != nil {
-		return fmt.Errorf("configure slave replication failed: %w", err)
+	if err := r.configureReplication(cfg, logFile, logPos); err != nil {
+		return err
 	}
-
-	r.logger.Success("Replication commands executed on slave")
 
 	r.logger.Info("Waiting for replica threads to stabilize...")
 	time.Sleep(5 * time.Second)
@@ -131,16 +111,65 @@ START REPLICA;
 	return nil
 }
 
+func (r *Replicator) configureReplication(cfg *ui.SetupConfig, logFile string, logPos int) error {
+	modernSQL := fmt.Sprintf(`
+STOP REPLICA;
+RESET REPLICA ALL;
+CHANGE REPLICATION SOURCE TO
+  SOURCE_HOST='%s',
+  SOURCE_USER='%s',
+  SOURCE_PASSWORD='%s',
+  SOURCE_LOG_FILE='%s',
+  SOURCE_LOG_POS=%d,
+  GET_SOURCE_PUBLIC_KEY=1;
+START REPLICA;
+`, cfg.MasterContainer, cfg.ReplUser, cfg.ReplPassword, logFile, logPos)
+
+	_, err := r.docker.Exec(cfg.SlaveContainer, []string{
+		"sh", "-c",
+		fmt.Sprintf(`mysql -uroot -p'%s' -e "%s"`, cfg.RootPassword, oneLineSQL(modernSQL)),
+	})
+	if err == nil {
+		r.logger.Success("Replication configured with modern syntax (CHANGE REPLICATION SOURCE TO)")
+		return nil
+	}
+
+	r.logger.Warn("Modern replication syntax failed, trying legacy CHANGE MASTER TO...")
+
+	legacySQL := fmt.Sprintf(`
+STOP SLAVE;
+RESET SLAVE ALL;
+CHANGE MASTER TO
+  MASTER_HOST='%s',
+  MASTER_USER='%s',
+  MASTER_PASSWORD='%s',
+  MASTER_LOG_FILE='%s',
+  MASTER_LOG_POS=%d;
+START SLAVE;
+`, cfg.MasterContainer, cfg.ReplUser, cfg.ReplPassword, logFile, logPos)
+
+	_, legacyErr := r.docker.Exec(cfg.SlaveContainer, []string{
+		"sh", "-c",
+		fmt.Sprintf(`mysql -uroot -p'%s' -e "%s"`, cfg.RootPassword, oneLineSQL(legacySQL)),
+	})
+	if legacyErr != nil {
+		return fmt.Errorf("configure replication failed: modern=%v legacy=%v", err, legacyErr)
+	}
+
+	r.logger.Success("Replication configured with legacy syntax (CHANGE MASTER TO)")
+	return nil
+}
+
 func (r *Replicator) Status(cfg *ui.SetupConfig) (string, error) {
 	r.logger.Info("Checking replica status...")
 
-	out, err := r.docker.Exec("mysql-slave", []string{
+	out, err := r.docker.Exec(cfg.SlaveContainer, []string{
 		"sh", "-c",
 		fmt.Sprintf(`mysql -uroot -p'%s' -e "SHOW REPLICA STATUS\G"`, cfg.RootPassword),
 	})
 	if err != nil {
 		r.logger.Warn("SHOW REPLICA STATUS failed, trying SHOW SLAVE STATUS")
-		out, err = r.docker.Exec("mysql-slave", []string{
+		out, err = r.docker.Exec(cfg.SlaveContainer, []string{
 			"sh", "-c",
 			fmt.Sprintf(`mysql -uroot -p'%s' -e "SHOW SLAVE STATUS\G"`, cfg.RootPassword),
 		})
@@ -153,21 +182,25 @@ func (r *Replicator) Status(cfg *ui.SetupConfig) (string, error) {
 	sqlRunning := extractField(out, []string{"Replica_SQL_Running", "Slave_SQL_Running"})
 	lag := extractField(out, []string{"Seconds_Behind_Source", "Seconds_Behind_Master"})
 	sourceHost := extractField(out, []string{"Source_Host", "Master_Host"})
+	sourceLogFile := extractField(out, []string{"Source_Log_File", "Master_Log_File"})
+	sourceLogPos := extractField(out, []string{"Read_Source_Log_Pos", "Exec_Master_Log_Pos", "Read_Master_Log_Pos"})
 	lastIOErr := extractField(out, []string{"Last_IO_Error"})
 	lastSQLErr := extractField(out, []string{"Last_SQL_Error"})
 
 	var b strings.Builder
 	b.WriteString("Replica status\n")
 	b.WriteString("----------------------\n")
-	b.WriteString(fmt.Sprintf("Source Host: %s\n", emptyAsUnknown(sourceHost)))
-	b.WriteString(fmt.Sprintf("IO Running : %s\n", emptyAsUnknown(ioRunning)))
-	b.WriteString(fmt.Sprintf("SQL Running: %s\n", emptyAsUnknown(sqlRunning)))
-	b.WriteString(fmt.Sprintf("Lag        : %s\n", emptyAsUnknown(lag)))
+	b.WriteString(fmt.Sprintf("Source Host : %s\n", emptyAsUnknown(sourceHost)))
+	b.WriteString(fmt.Sprintf("IO Running  : %s\n", emptyAsUnknown(ioRunning)))
+	b.WriteString(fmt.Sprintf("SQL Running : %s\n", emptyAsUnknown(sqlRunning)))
+	b.WriteString(fmt.Sprintf("Lag (sec)   : %s\n", emptyAsUnknown(lag)))
+	b.WriteString(fmt.Sprintf("Source Log  : %s\n", emptyAsUnknown(sourceLogFile)))
+	b.WriteString(fmt.Sprintf("Position    : %s\n", emptyAsUnknown(sourceLogPos)))
 	if strings.TrimSpace(lastIOErr) != "" {
-		b.WriteString(fmt.Sprintf("Last IO Err: %s\n", lastIOErr))
+		b.WriteString(fmt.Sprintf("Last IO Err : %s\n", lastIOErr))
 	}
 	if strings.TrimSpace(lastSQLErr) != "" {
-		b.WriteString(fmt.Sprintf("Last SQL Er: %s\n", lastSQLErr))
+		b.WriteString(fmt.Sprintf("Last SQL Err: %s\n", lastSQLErr))
 	}
 
 	return b.String(), nil

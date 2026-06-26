@@ -1,5 +1,7 @@
 APP_NAME=my-replica
-CMD=./cmd/repl-tool
+CMD=./cmd/my-replica
+
+.PHONY: build run tidy fmt clean build-linux build-windows build-all
 
 build:
 	go build -o bin/$(APP_NAME) $(CMD)
@@ -20,3 +22,9 @@ fmt:
 
 tidy:
 	go mod tidy
+
+clean:
+	rm -rf bin dist
+
+test:
+	go test ./...

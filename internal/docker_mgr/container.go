@@ -2,6 +2,7 @@ package docker_mgr
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"strings"
@@ -16,10 +17,24 @@ import (
 	"github.com/pouriatabari/my-replica/internal/ui"
 )
 
+func mysqlImage(version string) string {
+	v := strings.TrimSpace(version)
+	if v == "" {
+		return "mysql:8.0"
+	}
+	if strings.Contains(v, ":") {
+		return v
+	}
+	return "mysql:" + v
+}
+
 func (m *Manager) ensureImage(imageName string) error {
 	m.logger.Info("Pulling image: " + imageName)
 
-	reader, err := m.cli.ImagePull(m.ctx, imageName, image.PullOptions{})
+	ctx, cancel := context.WithTimeout(m.ctx, 10*time.Minute)
+	defer cancel()
+
+	reader, err := m.cli.ImagePull(ctx, imageName, image.PullOptions{})
 	if err != nil {
 		return fmt.Errorf("image pull failed: %w", err)
 	}
@@ -32,10 +47,13 @@ func (m *Manager) ensureImage(imageName string) error {
 }
 
 func (m *Manager) removeIfExists(name string) {
-	_, err := m.cli.ContainerInspect(m.ctx, name)
+	ctx, cancel := context.WithTimeout(m.ctx, 30*time.Second)
+	defer cancel()
+
+	_, err := m.cli.ContainerInspect(ctx, name)
 	if err == nil {
 		m.logger.Warn("Container already exists, removing: " + name)
-		_ = m.cli.ContainerRemove(m.ctx, name, container.RemoveOptions{
+		_ = m.cli.ContainerRemove(ctx, name, container.RemoveOptions{
 			Force:         true,
 			RemoveVolumes: true,
 		})
@@ -50,33 +68,36 @@ func (m *Manager) waitForMySQL(containerName string, cfg *ui.SetupConfig, isMast
 
 	m.logger.Info(fmt.Sprintf("Waiting for MySQL readiness on %s:%d ...", containerName, hostPort))
 
-	timeout := time.After(90 * time.Second)
-	tick := time.Tick(3 * time.Second)
+	deadline := time.Now().Add(90 * time.Second)
+	for time.Now().Before(deadline) {
+		ctx, cancel := context.WithTimeout(m.ctx, 10*time.Second)
+		out, err := m.execWithContext(ctx, containerName, []string{
+			"sh", "-c",
+			fmt.Sprintf("mysqladmin ping -uroot -p'%s' --silent", cfg.RootPassword),
+		})
+		cancel()
 
-	for {
-		select {
-		case <-timeout:
-			return fmt.Errorf("timeout waiting for mysql readiness in container %s", containerName)
-		case <-tick:
-			out, err := m.Exec(containerName, []string{
-				"sh", "-c",
-				fmt.Sprintf("mysqladmin ping -uroot -p'%s' --silent", cfg.RootPassword),
-			})
-			if err == nil && strings.Contains(strings.ToLower(out), "mysqld is alive") {
-				m.logger.Success("MySQL is ready in " + containerName)
-				return nil
-			}
+		if err == nil && strings.Contains(strings.ToLower(out), "mysqld is alive") {
+			m.logger.Success("MySQL is ready in " + containerName)
+			return nil
 		}
+		time.Sleep(3 * time.Second)
 	}
+
+	return fmt.Errorf("timeout waiting for mysql readiness in container %s", containerName)
 }
 
 func (m *Manager) RunMaster(cfg *ui.SetupConfig) error {
-	imageName := "mysql:" + cfg.MySQLVersion
+	if err := m.ensureDockerClient(); err != nil {
+		return err
+	}
+
+	imageName := mysqlImage(cfg.MySQLVersion)
 	if err := m.ensureImage(imageName); err != nil {
 		return err
 	}
 
-	m.removeIfExists("mysql-master")
+	m.removeIfExists(cfg.MasterContainer)
 
 	port, err := nat.NewPort("tcp", "3306")
 	if err != nil {
@@ -114,39 +135,44 @@ func (m *Manager) RunMaster(cfg *ui.SetupConfig) error {
 		},
 	}
 
-	networkingConfig := &container.NetworkingConfig{}
+	ctx, cancel := context.WithTimeout(m.ctx, 2*time.Minute)
+	defer cancel()
 
 	resp, err := m.cli.ContainerCreate(
-		m.ctx,
+		ctx,
 		containerConfig,
 		hostConfig,
-		networkingConfig,
 		nil,
-		"mysql-master",
+		nil,
+		cfg.MasterContainer,
 	)
 	if err != nil {
 		return fmt.Errorf("create master container failed: %w", err)
 	}
 
-	if err := m.cli.NetworkConnect(m.ctx, cfg.NetworkName, resp.ID, nil); err != nil {
+	if err := m.cli.NetworkConnect(ctx, cfg.NetworkName, resp.ID, nil); err != nil {
 		return fmt.Errorf("connect master to network failed: %w", err)
 	}
 
-	if err := m.cli.ContainerStart(m.ctx, resp.ID, container.StartOptions{}); err != nil {
+	if err := m.cli.ContainerStart(ctx, resp.ID, container.StartOptions{}); err != nil {
 		return fmt.Errorf("start master container failed: %w", err)
 	}
 
-	m.logger.Success("mysql-master container started")
-	return m.waitForMySQL("mysql-master", cfg, true)
+	m.logger.Success(cfg.MasterContainer + " container started")
+	return m.waitForMySQL(cfg.MasterContainer, cfg, true)
 }
 
 func (m *Manager) RunSlave(cfg *ui.SetupConfig) error {
-	imageName := "mysql:" + cfg.MySQLVersion
+	if err := m.ensureDockerClient(); err != nil {
+		return err
+	}
+
+	imageName := mysqlImage(cfg.MySQLVersion)
 	if err := m.ensureImage(imageName); err != nil {
 		return err
 	}
 
-	m.removeIfExists("mysql-slave")
+	m.removeIfExists(cfg.SlaveContainer)
 
 	port, err := nat.NewPort("tcp", "3306")
 	if err != nil {
@@ -184,34 +210,61 @@ func (m *Manager) RunSlave(cfg *ui.SetupConfig) error {
 		},
 	}
 
+	ctx, cancel := context.WithTimeout(m.ctx, 2*time.Minute)
+	defer cancel()
+
 	resp, err := m.cli.ContainerCreate(
-		m.ctx,
+		ctx,
 		containerConfig,
 		hostConfig,
 		nil,
 		nil,
-		"mysql-slave",
+		cfg.SlaveContainer,
 	)
 	if err != nil {
 		return fmt.Errorf("create slave container failed: %w", err)
 	}
 
-	if err := m.cli.NetworkConnect(m.ctx, cfg.NetworkName, resp.ID, nil); err != nil {
+	if err := m.cli.NetworkConnect(ctx, cfg.NetworkName, resp.ID, nil); err != nil {
 		return fmt.Errorf("connect slave to network failed: %w", err)
 	}
 
-	if err := m.cli.ContainerStart(m.ctx, resp.ID, container.StartOptions{}); err != nil {
+	if err := m.cli.ContainerStart(ctx, resp.ID, container.StartOptions{}); err != nil {
 		return fmt.Errorf("start slave container failed: %w", err)
 	}
 
-	m.logger.Success("mysql-slave container started")
-	return m.waitForMySQL("mysql-slave", cfg, false)
+	m.logger.Success(cfg.SlaveContainer + " container started")
+	return m.waitForMySQL(cfg.SlaveContainer, cfg, false)
+}
+
+func sanitizeCmd(cmd []string) string {
+	joined := strings.Join(cmd, " ")
+	replacements := []string{"-p'", "-p", "PASSWORD="}
+	for _, marker := range replacements {
+		if idx := strings.Index(joined, marker); idx >= 0 {
+			start := idx + len(marker)
+			end := start
+			for end < len(joined) && joined[end] != '\'' && joined[end] != ' ' {
+				end++
+			}
+			if end > start {
+				joined = joined[:start] + "****" + joined[end:]
+			}
+		}
+	}
+	return joined
 }
 
 func (m *Manager) Exec(containerName string, cmd []string) (string, error) {
-	m.logger.Info(fmt.Sprintf("Exec in %s: %s", containerName, strings.Join(cmd, " ")))
+	ctx, cancel := context.WithTimeout(m.ctx, 5*time.Minute)
+	defer cancel()
+	return m.execWithContext(ctx, containerName, cmd)
+}
 
-	execResp, err := m.cli.ContainerExecCreate(m.ctx, containerName, types.ExecConfig{
+func (m *Manager) execWithContext(ctx context.Context, containerName string, cmd []string) (string, error) {
+	m.logger.Info(fmt.Sprintf("Exec in %s: %s", containerName, sanitizeCmd(cmd)))
+
+	execResp, err := m.cli.ContainerExecCreate(ctx, containerName, types.ExecConfig{
 		Cmd:          cmd,
 		AttachStdout: true,
 		AttachStderr: true,
@@ -220,7 +273,7 @@ func (m *Manager) Exec(containerName string, cmd []string) (string, error) {
 		return "", fmt.Errorf("exec create failed: %w", err)
 	}
 
-	attachResp, err := m.cli.ContainerExecAttach(m.ctx, execResp.ID, types.ExecStartCheck{})
+	attachResp, err := m.cli.ContainerExecAttach(ctx, execResp.ID, types.ExecStartCheck{})
 	if err != nil {
 		return "", fmt.Errorf("exec attach failed: %w", err)
 	}
@@ -234,7 +287,7 @@ func (m *Manager) Exec(containerName string, cmd []string) (string, error) {
 		return "", fmt.Errorf("exec output read failed: %w", err)
 	}
 
-	inspect, err := m.cli.ContainerExecInspect(m.ctx, execResp.ID)
+	inspect, err := m.cli.ContainerExecInspect(ctx, execResp.ID)
 	if err != nil {
 		return "", fmt.Errorf("exec inspect failed: %w", err)
 	}

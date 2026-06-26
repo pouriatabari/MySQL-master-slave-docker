@@ -36,6 +36,8 @@ func New() *App {
 }
 
 func (a *App) Run() error {
+	defer a.docker.Close()
+
 	a.ui.BindActions(
 		a.handleSetup,
 		a.handleLoadTest,
@@ -45,7 +47,7 @@ func (a *App) Run() error {
 		a.handleCleanup,
 	)
 
-	a.logger.Info("Welcome to My Replica")
+	a.logger.Info("Welcome to my-replica")
 	a.logger.Info("Press 's' to start interactive setup")
 
 	return a.ui.Run()
@@ -59,7 +61,11 @@ func (a *App) handleDown() {
 			return
 		}
 
-		a.logger.Info("Down command is not implemented yet")
+		a.logger.Info("Stopping and removing master/slave containers...")
+		if err := a.docker.Down(cfg); err != nil {
+			a.logger.Error(fmt.Sprintf("Down failed: %v", err))
+			return
+		}
 	}()
 }
 
@@ -71,7 +77,33 @@ func (a *App) handleReset() {
 			return
 		}
 
-		a.logger.Info("Reset command is not implemented yet")
+		if !a.ui.ShowConfirmDialog("Reset", "Reset will stop containers, delete data directories, and run setup again.\n\nContinue?") {
+			a.logger.Warn("Reset cancelled")
+			return
+		}
+
+		a.logger.Info("Resetting environment...")
+		if err := a.docker.Down(cfg); err != nil {
+			a.logger.Error(fmt.Sprintf("Reset down failed: %v", err))
+			return
+		}
+
+		if err := a.docker.ResetDataDirs(cfg); err != nil {
+			a.logger.Error(fmt.Sprintf("Reset data dirs failed: %v", err))
+			return
+		}
+
+		if err := a.docker.PrepareEnvironment(cfg); err != nil {
+			a.logger.Error(fmt.Sprintf("Reset prepare failed: %v", err))
+			return
+		}
+
+		if err := a.replicator.Setup(cfg); err != nil {
+			a.logger.Error(fmt.Sprintf("Reset setup failed: %v", err))
+			return
+		}
+
+		a.logger.Success("Environment reset and replication reconfigured")
 	}()
 }
 
@@ -83,7 +115,16 @@ func (a *App) handleCleanup() {
 			return
 		}
 
-		a.logger.Info("Cleanup command is not implemented yet")
+		if !a.ui.ShowConfirmDialog("Cleanup", "Cleanup will stop containers, remove the Docker network, and delete dump files.\n\nData directories are kept unless you run reset.\n\nContinue?") {
+			a.logger.Warn("Cleanup cancelled")
+			return
+		}
+
+		a.logger.Info("Running cleanup...")
+		if err := a.docker.Cleanup(cfg); err != nil {
+			a.logger.Error(fmt.Sprintf("Cleanup failed: %v", err))
+			return
+		}
 	}()
 }
 
@@ -92,6 +133,12 @@ func (a *App) handleSetup() {
 		cfg, err := a.ui.ShowSetupForm()
 		if err != nil {
 			a.logger.Warn("Setup cancelled")
+			return
+		}
+
+		a.logger.Info("Validating Docker daemon access...")
+		if err := a.docker.ValidateDockerAvailable(); err != nil {
+			a.logger.Error(fmt.Sprintf("Docker unavailable: %v", err))
 			return
 		}
 
@@ -136,19 +183,31 @@ func (a *App) handleLoadTest() {
 			return
 		}
 
-		testCfg := tester.LoadTestConfig{
-			Workers:       4,
-			RequestsPerW:  250,
-			PayloadSize:   128,
-			Cleanup:       false,
-			ReportEvery:   2 * time.Second,
-			InsertTimeout: 5 * time.Second,
+		a.logger.Warn("Load test can increase CPU, disk I/O, binlog volume, and replica lag.")
+		a.logger.Warn("Use only on non-production environments.")
+
+		if !a.ui.ShowConfirmDialog("Load Test", "Run a safe replication load test?\n\nOnly table replication_bench is used.\n\nContinue?") {
+			a.logger.Warn("Load test cancelled")
+			return
+		}
+
+		testCfg, ok := a.ui.ShowLoadTestForm()
+		if !ok {
+			a.logger.Warn("Load test cancelled")
+			return
 		}
 
 		a.logger.Info("Starting safe load test on master...")
 		a.logger.Info("Benchmark table: replication_bench")
 
-		_, err := a.tester.Run(cfg, testCfg)
+		_, err := a.tester.Run(cfg, tester.LoadTestConfig{
+			Workers:       testCfg.Workers,
+			RequestsPerW:  testCfg.RequestsPerW,
+			PayloadSize:   testCfg.PayloadSize,
+			Cleanup:       testCfg.Cleanup,
+			ReportEvery:   2 * time.Second,
+			InsertTimeout: 5 * time.Second,
+		})
 		if err != nil {
 			a.logger.Error(fmt.Sprintf("Load test failed: %v", err))
 			return
