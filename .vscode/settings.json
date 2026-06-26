@@ -1,0 +1,8 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "/^Write-Host \"PWD:\" \\(Get-Location\\); Write-Host \"go version:\"; go version; Write-Host \"go env GOTOOLCHAIN:\" \\(go env GOTOOLCHAIN\\); Write-Host \"go env GOROOT:\" \\(go env GOROOT\\); Write-Host \"go\\.sum exists:\" \\(Test-Path \\.\\\\go\\.sum\\); if \\(Test-Path \\.\\\\go\\.sum\\) \\{ Get-Content \\.\\\\go\\.sum \\| Select-Object -First 20 \\}$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
+    }
+}
